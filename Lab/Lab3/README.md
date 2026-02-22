@@ -46,7 +46,7 @@ Lab3/
 
 ## Usage Guide
 ### Utility Scripts
-To setup the environment
+Helper script to quickly set up the environment
 ```
 source ./env.sh
 ```

@@ -41,7 +41,7 @@ Lab3/
   │
   ├── env.sh
   ├── 2025_CAD_HW3.zip        // TA-provided resources (tutorial, codes)
-  └── READMD.md
+  └── README.md
 ```
 
 ## Usage Guide

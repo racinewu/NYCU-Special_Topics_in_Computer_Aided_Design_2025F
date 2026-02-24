@@ -98,8 +98,8 @@
             mkdir -p ray_tmp
             export RAY_TMPDIR=$HOME/AutoCkt/ray_tmp
             ```
-        > [!IMPORTANT]  
-        > Environment Initialization: When using a different terminal session, you must execute the preceding commands. The first line is especially critical for setting up the environment.
+            > **IMPORTANT**  
+            > Environment Initialization: When using a different terminal session, you must execute the preceding commands. The first line is especially critical for setting up the environment.
         4. Start training
             ```
             ipython                            // Open ipython interface

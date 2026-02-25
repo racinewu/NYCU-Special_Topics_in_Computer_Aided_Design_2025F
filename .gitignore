@@ -1,0 +1,23 @@
+Slides/
+Exam/
+.vscode
+bin/
+build/
+
+Lab/Lab3/313580072_HW3/
+Lab/Lab3/313580072_HW3.zip
+Lab/Lab3/task1/PLL1_design
+Lab/Lab3/task2/PLL2_design
+Lab/Lab3/task3/ADC_design
+Lab/Lab3/task3/ADC_circuit/en_sim
+Lab/Lab3/task3/ADC_circuit/encoder_tb.vcd
+Lab/Lab3/HW3 Modeling Mixed Signal System and Simulating with AMS.pdf
+
+Lab/Lab4/313580072_HW4/
+Lab/Lab4/313580072_HW4.zip
+Lab/Lab4/HW4 Open-source Analog Sizing Tool AutoCkt.pdf
+Lab/Lab4/progress.csv
+
+*.docx
+*.xlsx
+/*.pdf

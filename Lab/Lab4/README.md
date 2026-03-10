@@ -11,7 +11,7 @@ Given a two-stage operational amplifier (op-amp) topology and a set of target sp
 - **Search Recovery**: Automatic reset mechanism that escapes local optima by restarting the search after a trial limit.
 
 ## Processing Pipeline
-1. **Stage 1 Model Training (Ref [Installation](Installation.md))**:
+1. **Stage 1 Model Training (Ref [Installation](./Installation.md))**:
     1. Environment Registration: Define the TwoStageAmp gym environment and register it using Ray/RLlib for reinforcement learning.
     2. PPO Training: Execute training sessions using Proximal Policy Optimization (PPO) to learn optimal sizing actions across a multi-dimensional parameter space.
     3. Quality Monitoring: Track episode_reward_mean and episode_len_mean via progress.csv to monitor model convergence and stability.

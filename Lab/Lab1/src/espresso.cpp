@@ -1,446 +1,544 @@
 #include "espresso.h"
-#include <fstream>
-#include <sstream>
-#include <stdexcept>
 #include <algorithm>
-#include <numeric>
-#include <cstring>
-#include <iostream>
-#include <random>
 #include <chrono>
+#include <climits>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <numeric>
+#include <random>
+#include <sstream>
+#include <iomanip>
+#include <iostream>
 
 using namespace std;
 
-// forEachCovered: iterate all 2^k minterms of an implicant
-template<typename Fn>
-static void __attribute__((noinline))
-forEachCovered(uint32_t base, uint32_t maskBits, int nBit, Fn &&fn) {
-    int freeBits[24], freeCnt = 0;
-    uint32_t mb = maskBits;
-    while (mb) { freeBits[freeCnt++] = __builtin_ctz(mb); mb &= mb-1; }
-    uint32_t n = 1u << freeCnt;
-    for (uint32_t combo = 0; combo < n; ++combo) {
-        uint32_t m = base;
-        for (int i = 0; i < freeCnt; ++i)
-            if (combo & (1u<<i)) m |= (1u << freeBits[i]);
-        fn(m);
+#ifdef VERBOSE
+#  define LOG(...) fprintf(stderr, __VA_ARGS__)
+#else
+#  define LOG(...) ((void)0)
+#endif
+
+// ==========================================================
+// Stop if best_lits has not improved for this many seconds.
+// Measured from the last time best_lits was updated, not from start.
+// Set to 0.0 to disable and run until time_limit.
+static constexpr double EARLY_STOP_SECS = 30.0;
+
+// Threshold for enumeration vs sub_count scan in CoverState operations.
+// ndc <= MAX_ENUM_DC -> enumerate 2^ndc minterms (fast for tight cubes).
+// ndc >  MAX_ENUM_DC -> scan sub_count keys via containment (fast when |ON| small).
+static constexpr int MAX_ENUM_DC = 16;
+// ==========================================================
+
+static auto g_start = chrono::steady_clock::now();
+static double elapsed() {return chrono::duration<double>(chrono::steady_clock::now() - g_start).count();}
+
+// cube_alg::tautology
+// Recursive Shannon expansion: F covers {0,1}^n_bit iff both cofactors do.
+namespace cube_alg {
+bool tautology(vector<Cube> F, int n_bit) {
+    F.erase(remove_if(F.begin(),F.end(),empty),F.end());
+    if (F.empty()) return false;
+    if (n_bit==0)  return true;
+    uint32_t univ = (n_bit >= 32) ? ~0u : (1u<<n_bit)-1;
+    for (auto& c:F) if (c.dc==univ) return true;  // universe cube -> trivially true
+    int b=0;
+    for (int i=0;i<n_bit;i++)
+        for (auto& c:F) if (!(c.dc&(1u<<i))) { b=i; goto found; }
+    found:
+    return tautology(cofactor(F,b,0),n_bit-1) &&
+           tautology(cofactor(F,b,1),n_bit-1);
+}
+} // namespace cube_alg
+
+// ==========================================================
+// CoverState tracking logic for minterm-level heuristics.
+// Holds sub_count[m], the number of cover cubes overlapping ON-minterm m.
+// Maintained incrementally across all phases without expensive full rebuilds.
+// ==========================================================
+void CoverState::adjust(const Cube& c, int delta) {
+    int ndc = __builtin_popcount(c.dc);
+    if (ndc <= MAX_ENUM_DC) {
+        // Small Cubes (ndc <= MAX_ENUM_DC): Enumerate 2^ndc minterms explicitly. [O(2^ndc)]
+        vector<int> fp; fp.reserve(ndc);
+        uint32_t tmp = c.dc;
+        while (tmp) { fp.push_back(__builtin_ctz(tmp)); tmp &= tmp-1; }
+        int total = 1 << (int)fp.size();
+        for (int i = 0; i < total; i++) {
+            uint32_t m = c.on;
+            for (int j = 0; j < (int)fp.size(); j++) if (i & (1<<j)) m |= (1u<<fp[j]);
+            auto it = sub_count.find(m);
+            if (it != sub_count.end()) it->second += delta;
+        }
+    } else {
+        // Large Cubes (ndc > MAX_ENUM_DC): Scan existing keys via containment. [O(|ON|)]
+        uint32_t fmask = ~c.dc, fon = c.on & fmask;
+        for (auto& [m,v] : sub_count) if ((m & fmask) == fon) v += delta;
     }
 }
 
-static inline uint32_t getBase(const Implicant &imp, uint32_t fullMask) {
-    return imp.on & fullMask & ~imp.mask;
+// ==================================================
+// Find ON minterms covered exclusively by c (sub_count == 1).
+// Used in Reduce phase to find essential shrinkage boundaries.
+// - out: list of exclusive minterms.
+// - fb : fallback minterm (any covered ON minterm).
+// Returns true if !out.empty().
+// ==================================================
+bool CoverState::exclusive_minterms(const Cube& c,
+                                     vector<uint32_t>& out,
+                                     uint32_t& fb) const {
+    out.clear(); fb = UINT32_MAX;
+    int ndc = __builtin_popcount(c.dc);
+    if (ndc <= MAX_ENUM_DC) {
+        vector<int> fp; fp.reserve(ndc);
+        uint32_t tmp = c.dc;
+        while (tmp) { fp.push_back(__builtin_ctz(tmp)); tmp &= tmp-1; }
+        int total = 1 << (int)fp.size();
+        for (int i = 0; i < total; i++) {
+            uint32_t m = c.on;
+            for (int j = 0; j < (int)fp.size(); j++) if (i & (1<<j)) m |= (1u<<fp[j]);
+            auto it = sub_count.find(m);
+            if (it == sub_count.end()) continue;
+            if (fb == UINT32_MAX) fb = m;
+            if (it->second == 1) out.push_back(m);
+        }
+    } else {
+        uint32_t fmask = ~c.dc, fon = c.on & fmask;
+        for (auto& [m,v] : sub_count) {
+            if ((m & fmask) != fon) continue;
+            if (fb == UINT32_MAX) fb = m;
+            if (v == 1) out.push_back(m);
+        }
+    }
+    return !out.empty();
+}
+
+// Returns true if c is redundant: every ON minterm it covers has sub_count >= 2,
+// meaning c can be safely removed without uncovering any minterm.
+bool CoverState::is_redundant(const Cube& c) const {
+    int ndc = __builtin_popcount(c.dc);
+    if (ndc <= MAX_ENUM_DC) {
+        vector<int> fp; fp.reserve(ndc);
+        uint32_t tmp = c.dc;
+        while (tmp) { fp.push_back(__builtin_ctz(tmp)); tmp &= tmp-1; }
+        int total = 1 << (int)fp.size();
+        for (int i = 0; i < total; i++) {
+            uint32_t m = c.on;
+            for (int j = 0; j < (int)fp.size(); j++) if (i & (1<<j)) m |= (1u<<fp[j]);
+            auto it = sub_count.find(m);
+            if (it != sub_count.end() && it->second <= 1) return false;
+        }
+    } else {
+        uint32_t fmask = ~c.dc, fon = c.on & fmask;
+        for (auto& [m,v] : sub_count)
+            if ((m & fmask) == fon && v <= 1) return false;
+    }
+    return true;
 }
 
 // I/O
-void Espresso::parseSpec(const string &path) {
-    ifstream f(path);
-    if (!f) throw runtime_error("Cannot open: " + path);
+// Parse spec file: n_bit, ON minterms, DC minterms.
+// Builds safe_hash = ON ∪ DC for the OFF oracle (hits_off).
+void Espresso::parse(const char* specFile) {
+    ifstream fin(specFile);
+    if (!fin) { cerr<<"Cannot open "<<specFile<<"\n"; exit(1); }
     string line;
-    getline(f, line); nBit = stoi(line);
-    fullMask      = (nBit == 0) ? 0u : ((1u << nBit) - 1u);
-    totalMinterms = (nBit == 0) ? 1u : (1u << nBit);
-    offArr.assign(totalMinterms, 1);
-    onArr .assign(totalMinterms, 0);
-    getline(f, line);
-    { istringstream ss(line); uint32_t v;
-      while (ss>>v) { onArr[v]=1; offArr[v]=0; onVec.push_back(v); } }
-    getline(f, line);
-    { istringstream ss(line); uint32_t v; while (ss>>v) offArr[v]=0; }
-    onSize = (int)onVec.size();
+    getline(fin,line); n_bit = stoi(line);
+    full_mask = (n_bit >= 32) ? ~0u : n_bit ? (1u<<n_bit)-1 : 0;
+    getline(fin,line);
+    { istringstream ss(line); uint32_t m; while(ss>>m) on_set.push_back({m,0}); }
+    getline(fin,line);
+    { istringstream ss(line); uint32_t m; while(ss>>m) dc_set.push_back({m,0}); }
+
+    safe_hash.clear();
+    safe_hash.reserve(on_set.size() + dc_set.size());
+    for (auto& c:on_set) safe_hash.insert(c.on);
+    for (auto& c:dc_set) safe_hash.insert(c.on);
+    cout << "[ESPRESSO] n=" << n_bit 
+          << " on=" << on_set.size() 
+          << " dc=" << dc_set.size() 
+          << " safe=" << safe_hash.size() << endl;
 }
 
-void Espresso::writeOutput(const string &path, const vector<Implicant> &F) {
-    ofstream f(path);
-    if (!f) throw runtime_error("Cannot open output: " + path);
-    if (nBit == 0) { f << "\n"; return; }
-    for (auto &imp : F) f << toStr(imp) << "\n";
-}
-
-string Espresso::toStr(const Implicant &imp) const {
-    string s(nBit, '0');
-    for (int i = 0; i < nBit; ++i) {
-        int b = nBit - 1 - i;
-        if      (imp.mask & (1u<<b)) s[i] = '-';
-        else if (imp.on   & (1u<<b)) s[i] = '1';
+// Write SOP cover: each cube as a string of '0', '1', '-' (MSB first).
+void Espresso::write_cover(const vector<Cube>& cv, const char* path) const {
+    FILE* f = fopen(path,"w"); if (!f) return;
+    if (n_bit==0) { fprintf(f,"\n"); fclose(f); return; }
+    for (auto& c:cv) {
+        for (int b=n_bit-1;b>=0;b--) {
+            uint32_t bit=1u<<b;
+            if      (c.dc&bit) fputc('-',f);
+            else if (c.on&bit) fputc('1',f);
+            else               fputc('0',f);
+        }
+        fputc('\n',f);
     }
-    return s;
+    fclose(f);
 }
 
-int Espresso::countLiterals(const vector<Implicant> &F) const {
-    int c = 0;
-    for (auto &imp : F)
-        c += nBit - __builtin_popcount(imp.mask);
+// Utility
+
+// Total literal count = sum of fixed bits across all cubes.
+int Espresso::lit_count(const vector<Cube>& cv) const {
+    int n=0; for (auto& c:cv) n += n_bit - __builtin_popcount(c.dc); return n;
+}
+
+// Remove duplicate cubes; update sub_count decrementally for removed entries.
+void Espresso::dedup() {
+    CubeSet seen;
+    vector<CoverEntry> r; r.reserve(cover.size());
+    for (auto& e : cover) {
+        if (seen.insert(e.cube).second) {
+            r.push_back(e);
+        } else {
+            state.remove(e.cube);  // keep sub_count consistent
+        }
+    }
+    LOG("[%.1fs] dedup: %zu -> %zu\n", elapsed(), cover.size(), r.size());
+    cover = move(r);
+}
+
+// Full rebuild of sub_count from current cover. Called after restore_best.
+void Espresso::rebuild_state() {
+    state.init(on_set);
+    for (auto& e:cover) state.add(e.cube);
+}
+
+// Save cover as best if it improves on best_lits; write to output file.
+void Espresso::try_save() {
+    vector<Cube> cubes; cubes.reserve(cover.size());
+    for (auto& e:cover) cubes.push_back(e.cube);
+    int lits = lit_count(cubes);
+    if (lits < best_lits) {
+        best_lits = lits; best = cubes;
+        LOG("[%.1fs] BEST %zu cubes, %d lits\n", elapsed(), cover.size(), lits);
+        write_cover(cubes, out_file.c_str());
+    }
+}
+
+// Restore cover from best; mark all cubes dirty so expand re-processes them.
+void Espresso::restore_best() {
+    cover.clear(); cover.reserve(best.size());
+    for (auto& c:best) cover.push_back({c, true});
+    rebuild_state();
+}
+
+// ==================================================
+// OFF oracle: Check if cube 'c' intersects the OFF-set.
+// Verified via safe_hash (ON + DC); c hits OFF iff any minterm ∉ safe_hash.
+// - ndc <= MAX_ENUM_DC: Forward scan (enumerate 2^ndc minterms, early exit on first miss).
+// - ndc >  MAX_ENUM_DC: Reverse scan (count matches in safe_hash, safe if count == 2^ndc).
+// ==================================================
+bool Espresso::hits_off(const Cube& c) const {
+    if (c.dc==0) return !safe_hash.count(c.on);
+    int ndc = __builtin_popcount(c.dc);
+    if (ndc <= MAX_ENUM_DC) {
+        vector<int> fp; fp.reserve(ndc);
+        uint32_t tmp = c.dc;
+        while (tmp) { fp.push_back(__builtin_ctz(tmp)); tmp &= tmp-1; }
+        int total = 1 << (int)fp.size();
+        for (int i=0; i<total; i++) {
+            uint32_t m = c.on;
+            for (int j=0; j<(int)fp.size(); j++) if (i&(1<<j)) m |= (1u<<fp[j]);
+            if (!safe_hash.count(m)) return true;
+        }
+        return false;
+    }
+    // Reverse scan: need = 2^ndc. Guard: ndc < 63 to avoid UB on 1LL<<ndc.
+    uint32_t fmask = ~c.dc & full_mask, fon = c.on & fmask;
+    long long need = (ndc < 63) ? (1LL << ndc) : LLONG_MAX;
+    long long found = 0;
+    for (uint32_t m : safe_hash)
+        if ((m & fmask) == fon && ++found == need) return false;
+    return true;
+}
+
+// ==================================================
+// Phase 1: Expand
+// - expand_one: Greedily expands one bit at a time. Candidate is accepted 
+//               iff it does not intersect the OFF-set (via hits_off).
+// - expand_all: Expands all dirty cubes (shrunk in previous Reduce phase).
+//               Skips non-dirty cubes to prevent redundant work.
+//               Aborts early if the 'tmax' wall-clock deadline is exceeded.
+// ==================================================
+Cube Espresso::expand_one(Cube c, const vector<int>& order) const {
+    for (int b:order) {
+        uint32_t bit = 1u<<b;
+        if (c.dc&bit) continue;
+        Cube cand = {c.on&~bit, c.dc|bit};
+        if (!hits_off(cand)) c = cand;
+    }
     return c;
 }
 
-// expandOne: try a specific bit ordering, return best expansion
-__attribute__((noinline))
-Implicant Espresso::expandWithOrder(const Implicant &imp,
-                                     const int *order) const {
-    Implicant cur = imp;
-    bool progress = true;
-    while (progress) {
-        progress = false;
-        for (int oi = 0; oi < nBit; ++oi) {
-            int b = order[oi];
-            if (cur.mask & (1u<<b)) continue;
-            uint32_t curBase = getBase(cur, fullMask);
-            uint32_t newBase = curBase ^ (1u<<b);
-            bool safe = true;
-            forEachCovered(newBase, cur.mask, nBit, [&](uint32_t m) {
-                if (offArr[m]) safe = false;
-            });
-            if (safe) {
-                cur.mask |= (1u<<b);
-                cur.on   &= ~(1u<<b);
-                progress = true;
+void Espresso::expand_all(const vector<int>& order, double tmax) {
+    int processed = 0;
+    for (auto& e : cover) {
+        if (elapsed() >= tmax) break;
+        if (!e.dirty) continue;
+        Cube nc = expand_one(e.cube, order);
+        if (nc.on != e.cube.on || nc.dc != e.cube.dc) {
+            state.remove(e.cube);
+            e.cube = nc;
+            state.add(e.cube);
+        }
+        e.dirty = false;
+        processed++;
+    }
+    LOG("[%.1fs] expand: %d/%zu cubes\n", elapsed(), processed, cover.size());
+}
+
+// ==================================================
+// Phase 2: Reduce
+// - reduce_one: Shrinks cube 'c' toward its exclusive minterms by fixing DC bits
+//               to values agreed upon by 'excl'. Collapses to a unit cube if empty.
+// - reduce_phase: Reduces all cubes sequentially. Marked changed cubes dirty for Expand.
+//                 Processing order (large DC first) maximizes shrinkage flexibility.
+// ==================================================
+Cube Espresso::reduce_one(const Cube& c) const {
+    vector<uint32_t> excl; uint32_t fb;
+    state.exclusive_minterms(c, excl, fb);
+    if (excl.empty()) return (fb==UINT32_MAX) ? c : Cube{fb,0};
+    Cube r = c;
+    for (int b=n_bit-1; b>=0; b--) {
+        uint32_t bit = 1u<<b;
+        if (!(r.dc&bit)) continue;
+        bool has0=false, has1=false;
+        for (uint32_t m:excl) {
+            if (m&bit) has1=true; else has0=true;
+            if (has0&&has1) break;
+        }
+        if      (!has0) r = {(r.on&~bit)|bit, r.dc&~bit};
+        else if (!has1) r = {(r.on&~bit),     r.dc&~bit};
+    }
+    return r;
+}
+
+int Espresso::reduce_phase(double tmax) {
+    int shrunk = 0;
+    for (auto& e : cover) {
+        if (elapsed() >= tmax) break;
+        e.dirty = false;
+        Cube nc = reduce_one(e.cube);
+        if (nc.on != e.cube.on || nc.dc != e.cube.dc) {
+            state.remove(e.cube);
+            e.cube = nc;
+            state.add(e.cube);
+            e.dirty = true;
+            shrunk++;
+        }
+    }
+    LOG("[%.1fs] reduce: %d/%zu shrunk\n", elapsed(), shrunk, cover.size());
+    return shrunk;
+}
+
+// ==================================================
+// Phase 3: Irredundant
+// Removes redundant cubes whose covered ON-minterms are already fully covered 
+// by others (sub_count > 1). Shuffles first to randomize tie-breaking, then 
+// stable_sorts by DC count so larger cubes are evaluated for removal first.
+// ==================================================
+int Espresso::irredundant_phase(mt19937& rng) {
+    shuffle(cover.begin(), cover.end(), rng);
+    stable_sort(cover.begin(), cover.end(), [](const CoverEntry& a, const CoverEntry& b) {
+        return __builtin_popcount(a.cube.dc) > __builtin_popcount(b.cube.dc);
+    });
+    vector<CoverEntry> keep; keep.reserve(cover.size());
+    for (auto& e : cover) {
+        if (state.is_redundant(e.cube)) state.remove(e.cube);
+        else                            keep.push_back(e);
+    }
+    int removed = (int)cover.size() - (int)keep.size();
+    cover = move(keep);
+    LOG("[%.1fs] irred: %d removed, %zu remain\n", elapsed(), removed, cover.size());
+    return removed;
+}
+
+// Subsume Pass
+// Removes cube c if a 1-bit larger superset b (b ⊇ c) exists in the cover.
+// Efficient structural dominance check, sufficient right after Expand.
+void Espresso::subsume_pass() {
+    CubeSet cs; for (auto& e:cover) cs.insert(e.cube);
+    vector<CoverEntry> r; r.reserve(cover.size());
+    for (auto& e : cover) {
+        bool sub = false;
+        uint32_t tmp = full_mask & ~e.cube.dc;
+        while (tmp && !sub) {
+            int b = __builtin_ctz(tmp); tmp &= tmp-1;
+            if (cs.count({e.cube.on&~(1u<<b), e.cube.dc|(1u<<b)})) sub = true;
+        }
+        if (sub) state.remove(e.cube);
+        else     r.push_back(e);
+    }
+    cover = move(r);
+}
+
+// Seed Cover
+// Seeds any ON-minterms left uncovered after QMC as unit cubes.
+// Establishes the foundational base invariant: cover ⊇ ON-set.
+void Espresso::seed_cover() {
+    unordered_set<uint32_t> covered; covered.reserve(on_set.size());
+    for (auto& e : cover) {
+        int ndc = __builtin_popcount(e.cube.dc);
+        if (ndc <= MAX_ENUM_DC) {
+            vector<int> fp; fp.reserve(ndc);
+            uint32_t tmp = e.cube.dc;
+            while (tmp) { fp.push_back(__builtin_ctz(tmp)); tmp &= tmp-1; }
+            int total = 1 << (int)fp.size();
+            for (int i=0; i<total; i++) {
+                uint32_t m = e.cube.on;
+                for (int j=0; j<(int)fp.size(); j++) if (i&(1<<j)) m |= (1u<<fp[j]);
+                covered.insert(m);
             }
+        } else {
+            uint32_t fmask = ~e.cube.dc, fon = e.cube.on & fmask;
+            for (auto& on:on_set) if ((on.on&fmask)==fon) covered.insert(on.on);
         }
     }
-    return cur;
+    for (auto& on : on_set)
+        if (!covered.count(on.on)) { cover.push_back({on, false}); state.add(on); }
 }
 
-// expandOne: try multiple bit orderings, return the one with most don't-cares
-__attribute__((noinline))
-Implicant Espresso::expandOne(const Implicant &imp) const {
-    // Always try MSB→LSB first
-    int order0[24] = {};
-    for (int i = 0; i < nBit; ++i) order0[i] = nBit-1-i;
-    Implicant best = expandWithOrder(imp, order0);
-    int bestDC = __builtin_popcount(best.mask);
 
-    // Try LSB→MSB
-    int order1[24] = {};
-    for (int i = 0; i < nBit; ++i) order1[i] = i;
-    Implicant r = expandWithOrder(imp, order1);
-    if (__builtin_popcount(r.mask) > bestDC) { best = r; bestDC = __builtin_popcount(r.mask); }
-
-    // Try random orderings (seeded by the implicant value for determinism)
-    uint32_t seed = imp.on * 2654435761u;
-    int orderR[24] = {};
-    for (int trial = 0; trial < numExpandTrials-2; ++trial) {
-        for (int i = 0; i < nBit; ++i) orderR[i] = i;
-        // Fisher-Yates with LCG
-        for (int i = nBit-1; i > 0; --i) {
-            seed = seed * 1664525u + 1013904223u;
-            int j = seed % (i+1);
-            int tmp = orderR[i]; orderR[i] = orderR[j]; orderR[j] = tmp;
-        }
-        r = expandWithOrder(imp, orderR);
-        int dc = __builtin_popcount(r.mask);
-        if (dc > bestDC) { best = r; bestDC = dc; }
-    }
-    return best;
-}
-
-void Espresso::expandAll(vector<Implicant> &F) const {
-    for (auto &imp : F) imp = expandOne(imp);
-}
-
-// irredundant: essential + greedy + redundancy sweep
-__attribute__((noinline))
-void Espresso::irredundant(vector<Implicant> &F) const {
-    if (F.empty()) return;
-    int N = (int)F.size();
-
-    // coverCount[m]: how many implicants in F cover m (capped at 2)
-    // singleCover[m]: index if exactly 1 implicant covers m
-    vector<uint8_t> coverCount(totalMinterms, 0);
-    vector<int>     singleCover(totalMinterms, -1);
-
-    for (int i = 0; i < N; ++i) {
-        uint32_t base = getBase(F[i], fullMask);
-        forEachCovered(base, F[i].mask, nBit, [&](uint32_t m) {
-            if (!onArr[m]) return;
-            uint8_t &cc = coverCount[m];
-            if (cc == 0) { cc = 1; singleCover[m] = i; }
-            else if (cc == 1 && singleCover[m] != i) { cc = 2; }
-        });
-    }
-
-    // Essential implicants
-    vector<bool> essential(N, false);
-    for (auto m : onVec)
-        if (coverCount[m] == 1) essential[singleCover[m]] = true;
-
-    // Per-implicant on-coverage count (for greedy sorting)
-    vector<int> cov(N, 0);
-    for (int i = 0; i < N; ++i) {
-        uint32_t base = getBase(F[i], fullMask);
-        forEachCovered(base, F[i].mask, nBit, [&](uint32_t m){ cov[i] += onArr[m]; });
-    }
-
-    // Sort non-essential by coverage desc
-    vector<int> nonEss;
-    nonEss.reserve(N);
-    for (int i = 0; i < N; ++i)
-        if (!essential[i]) nonEss.push_back(i);
-    sort(nonEss.begin(), nonEss.end(), [&](int a, int b){ return cov[a] > cov[b]; });
-
-    // Mark minterms covered by essentials
-    vector<uint8_t> covered(totalMinterms, 0);
-    int remaining = onSize;
-    vector<bool> selected = essential;
-
-    for (int i = 0; i < N; ++i) {
-        if (!essential[i]) continue;
-        uint32_t base = getBase(F[i], fullMask);
-        forEachCovered(base, F[i].mask, nBit, [&](uint32_t m) {
-            if (onArr[m] && !covered[m]) { covered[m]=1; --remaining; }
-        });
-    }
-
-    // Greedy phase
-    for (int i : nonEss) {
-        if (remaining == 0) break;
-        uint32_t base = getBase(F[i], fullMask);
-        int newCov = 0;
-        forEachCovered(base, F[i].mask, nBit, [&](uint32_t m) {
-            if (onArr[m] && !covered[m]) ++newCov;
-        });
-        if (newCov > 0) {
-            selected[i] = true;
-            forEachCovered(base, F[i].mask, nBit, [&](uint32_t m) {
-                if (onArr[m] && !covered[m]) { covered[m]=1; --remaining; }
-            });
+// QMC Consensus Round
+// Performs one round of Quine-McCluskey distance-1 merging.
+// Pairs differing by exactly 1 bit are merged via 64-bit hash grouping.
+// Returns false when no further merges occur (convergence reached).
+bool Espresso::consensus_round(vector<Cube>& cubes) {
+    int n = cubes.size();
+    vector<bool> merged(n,false); vector<Cube> nc;
+    for (int b=0; b<n_bit; b++) {
+        uint32_t bit = 1u<<b;
+        unordered_map<uint64_t,int> grp; grp.reserve(n);
+        for (int i=0; i<n; i++) {
+            if (merged[i]||(cubes[i].dc&bit)) continue;
+            uint64_t k = ((uint64_t)cubes[i].dc<<32)|(cubes[i].on&~bit);
+            auto it = grp.find(k);
+            if (it!=grp.end()&&!merged[it->second]) {
+                merged[i]=merged[it->second]=true;
+                nc.push_back({cubes[i].on&~bit, cubes[i].dc|bit});
+                grp.erase(it);
+            } else grp[k]=i;
         }
     }
-
-    // Safety net: patch any still-uncovered minterms
-    if (remaining > 0) {
-        for (auto m : onVec) {
-            if (covered[m]) continue;
-            int i = singleCover[m]; // if ==1, use it; else scan
-            if (i >= 0 && i < N) {
-                if (!selected[i]) selected[i] = true;
-                uint32_t base = getBase(F[i], fullMask);
-                forEachCovered(base, F[i].mask, nBit, [&](uint32_t mm) {
-                    if (onArr[mm] && !covered[mm]) { covered[mm]=1; --remaining; }
-                });
-            } else {
-                // Scan all implicants for one covering m
-                for (int j = 0; j < N; ++j) {
-                    uint32_t care = fullMask & ~F[j].mask;
-                    if ((m & care) == (F[j].on & care)) {
-                        selected[j] = true;
-                        uint32_t base = getBase(F[j], fullMask);
-                        forEachCovered(base, F[j].mask, nBit, [&](uint32_t mm) {
-                            if (onArr[mm] && !covered[mm]) { covered[mm]=1; --remaining; }
-                        });
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // Rebuild F
-    vector<Implicant> newF;
-    newF.reserve(N);
-    for (int i = 0; i < N; ++i)
-        if (selected[i]) newF.push_back(F[i]);
-    F = move(newF);
-
-    // ── Redundancy sweep: remove implicants whose coverage is subsumed ──
-    // Re-check: can we drop any selected implicant?
-    // Build covered counts again with final selection
-    fill(coverCount.begin(), coverCount.end(), 0);
-    fill(singleCover.begin(), singleCover.end(), -1);
-    N = (int)F.size();
-    for (int i = 0; i < N; ++i) {
-        uint32_t base = getBase(F[i], fullMask);
-        forEachCovered(base, F[i].mask, nBit, [&](uint32_t m) {
-            if (!onArr[m]) return;
-            uint8_t &cc = coverCount[m];
-            if (cc == 0) { cc = 1; singleCover[m] = i; }
-            else if (cc == 1 && singleCover[m] != i) { cc = 2; }
-        });
-    }
-    // An implicant is redundant if it covers NO minterm with coverCount==1
-    vector<bool> keep(N, false);
-    for (auto m : onVec)
-        if (coverCount[m] == 1) keep[singleCover[m]] = true;
-    // Greedily remove non-essential ones (those with keep=false)
-    // But we must ensure coverage: if we remove one, re-check others
-    // Simple pass: mark all keep=true ones, others need coverage check
-    {
-        vector<uint8_t> covAfter(totalMinterms, 0);
-        for (int i = 0; i < N; ++i) {
-            if (!keep[i]) continue;
-            uint32_t base = getBase(F[i], fullMask);
-            forEachCovered(base, F[i].mask, nBit, [&](uint32_t m) {
-                if (onArr[m]) covAfter[m] = 1;
-            });
-        }
-        // Check which non-kept implicants still add coverage
-        for (int i = 0; i < N; ++i) {
-            if (keep[i]) continue;
-            uint32_t base = getBase(F[i], fullMask);
-            bool needed = false;
-            forEachCovered(base, F[i].mask, nBit, [&](uint32_t m) {
-                if (onArr[m] && !covAfter[m]) needed = true;
-            });
-            if (needed) {
-                keep[i] = true;
-                forEachCovered(base, F[i].mask, nBit, [&](uint32_t m) {
-                    if (onArr[m]) covAfter[m] = 1;
-                });
-            }
-        }
-    }
-    vector<Implicant> newF2;
-    newF2.reserve(N);
-    for (int i = 0; i < N; ++i)
-        if (keep[i]) newF2.push_back(F[i]);
-    F = move(newF2);
+    if (nc.empty()) return false;
+    vector<Cube> next;
+    for (int i=0;i<n;i++) if (!merged[i]) next.push_back(cubes[i]);
+    for (auto& c:nc) next.push_back(c);
+    CubeSet seen; cubes.clear();
+    for (auto& c:next) if (seen.insert(c).second) cubes.push_back(c);
+    return true;
 }
 
-// reduce: shrink implicants for next expand iteration
-__attribute__((noinline))
-void Espresso::reduce(vector<Implicant> &F) const {
-    int N = (int)F.size();
-    if (N == 0) return;
+// Pipeline
+void Espresso::run(double time_limit) {
+    if (n_bit==0) { cover.push_back({{0,0},false}); return; }
+    if (on_set.empty()) return;
 
-    vector<int> coveredBy(totalMinterms, -1);
-    for (int i = 0; i < N; ++i) {
-        uint32_t base = getBase(F[i], fullMask);
-        forEachCovered(base, F[i].mask, nBit, [&](uint32_t m) {
-            if (!onArr[m]) return;
-            if      (coveredBy[m] == -1) coveredBy[m] = i;
-            else if (coveredBy[m] != i)  coveredBy[m] = N;
-        });
+    // 1. QMC: merge unit cubes into larger cubes via distance-1 consensus.
+    //    Runs up to 30s; stops when no more merges are possible.
+    vector<Cube> cubes = on_set;
+    for (int r=0; elapsed()<30.0; r++) {
+        if (!consensus_round(cubes)) break;
+        LOG("[%.1fs] qmc %d\n", elapsed(), r);
     }
+    cover.clear(); cover.reserve(cubes.size());
+    for (auto& c:cubes) cover.push_back({c, false});
+    dedup();
 
-    for (int i = 0; i < N; ++i) {
-        vector<uint32_t> excl;
-        uint32_t base = getBase(F[i], fullMask);
-        forEachCovered(base, F[i].mask, nBit, [&](uint32_t m) {
-            if (onArr[m] && coveredBy[m] == i) excl.push_back(m);
-        });
-        if (excl.empty()) continue;
+    // 2. Seed: initialise sub_count and fill any uncovered ON minterms.
+    state.init(on_set);
+    for (auto& e:cover) state.add(e.cube);
+    seed_cover();
+    LOG("[%.1fs] post-QMC: %zu cubes\n", elapsed(), cover.size());
 
-        Implicant imp = F[i];
-        for (int b = 0; b < nBit; ++b) {
-            if (!(imp.mask & (1u<<b))) continue;
-            // Try 0
-            Implicant c = imp; c.mask &= ~(1u<<b); c.on &= ~(1u<<b);
-            uint32_t cr = fullMask & ~c.mask; bool ok = true;
-            for (auto m : excl) if ((m&cr) != (c.on&cr)) { ok=false; break; }
-            if (ok) { imp = c; continue; }
-            // Try 1
-            c = imp; c.mask &= ~(1u<<b); c.on |= (1u<<b);
-            cr = fullMask & ~c.mask; ok = true;
-            for (auto m : excl) if ((m&cr) != (c.on&cr)) { ok=false; break; }
-            if (ok) imp = c;
+    // 3. Initial full expand: maximise all cubes, then remove subsumed ones.
+    for (auto& e:cover) e.dirty = true;
+    vector<int> order(n_bit); iota(order.begin(),order.end(),0);
+    reverse(order.begin(), order.end());
+    expand_all(order, time_limit);
+    dedup(); subsume_pass();
+    try_save();
+    for (auto& e:cover) e.dirty = false;
+
+    // ==================================================
+    // Phase 4: Main Loop (Reduce -> Irredundant -> Expand)
+    // Iteratively optimizes the cover until convergence, stall, or timeout.
+    // Stopping conditions:
+    //   (a) Structural fixed point: Cover is completely unchanged.
+    //   (a2) Extreme rigid structure: Futile to optimize rigid/checkerboard covers.
+    //   (b) Stall timeout: No literal improvement for EARLY_STOP_SECS.
+    //   (c) Hard wall-clock timeout.
+    // ==================================================
+    mt19937 rng(chrono::steady_clock::now().time_since_epoch().count());
+    double last_improve_t = elapsed();
+
+    for (int iter=0; elapsed()<time_limit-3.0; iter++) {
+        double tmax = min(time_limit-3.0, elapsed()+time_limit/30.0);
+
+        int shrunk  = reduce_phase(tmax);
+        int removed = irredundant_phase(rng);
+
+        // (a) Structural fixed point
+        if (shrunk == 0 && removed == 0) {
+            LOG("[%.1fs] structural fixed point -- stop (iter=%d)\n", elapsed(), iter);
+            break;
         }
-        F[i] = imp;
-    }
-}
 
-// verifyAndPatch: guarantee all on-set minterms are covered
-void Espresso::verifyAndPatch(vector<Implicant> &F) const {
-    vector<uint8_t> chk(totalMinterms, 0);
-    for (auto &imp : F) {
-        uint32_t base = getBase(imp, fullMask);
-        forEachCovered(base, imp.mask, nBit, [&](uint32_t m){ chk[m]=1; });
-    }
-    for (auto m : onVec)
-        if (!chk[m]) F.push_back({m, 0u});
-}
-
-vector<Implicant> Espresso::initialCover() const {
-    vector<Implicant> F;
-    F.reserve(onVec.size());
-    for (auto m : onVec) F.push_back({m, 0u});
-    return F;
-}
-
-// Deduplicate helper
-static void dedup(vector<Implicant> &F) {
-    sort(F.begin(), F.end());
-    F.erase(unique(F.begin(), F.end()), F.end());
-}
-
-// solve
-void Espresso::solve(const string &specFile, const string &outFile) {
-    parseSpec(specFile);
-    if (onSize == 0) { writeOutput(outFile, {}); return; }
-    if (nBit == 0)   { writeOutput(outFile, {{0,0}}); return; }
-
-    auto wallMs = [](){ 
-        return chrono::duration_cast<chrono::milliseconds>(
-            chrono::steady_clock::now().time_since_epoch()).count();
-    };
-    long long t0 = wallMs();
-    long long timeLimitMs = 150000; // 2.5 minutes limit (leave margin)
-
-    vector<Implicant> F = initialCover();
-
-    // Estimate trials based on case size
-    // Each trial costs ~proportional to onSize
-    // Budget: 100 seconds total for first expand pass
-    // trial_cost ≈ onSize * nBit * avg_2^freeCnt ≈ onSize * nBit * 4
-    // trials = min(16, max(2, 100000ms / estimated_cost_per_trial_ms))
-    bool largeCase = (onSize > 200000);
-    int estimatedMsPerTrial = (int)((long long)onSize * nBit / 5000); // rough estimate
-    numExpandTrials = 16;
-    while (numExpandTrials > 2 && numExpandTrials * estimatedMsPerTrial > 80000)
-        numExpandTrials /= 2;
-    numExpandTrials = max(2, min(16, numExpandTrials));
-
-    expandAll(F);
-    dedup(F);
-    irredundant(F);
-    verifyAndPatch(F);
-
-    int bestLit = countLiterals(F);
-    vector<Implicant> bestF = F;
-
-    if (!largeCase) {
-        // ── Iterations: reduce → expand → irredundant ──
-        const int MAX_ITER = 20;
-        for (int iter = 0; iter < MAX_ITER; ++iter) {
-            long long elapsed = wallMs() - t0;
-            if (elapsed > timeLimitMs) break;
-            numExpandTrials = (elapsed < 30000) ? 8 : 4;
-            auto prev = F;
-            reduce(F);
-            expandAll(F);
-            dedup(F);
-            irredundant(F);
-            verifyAndPatch(F);
-            dedup(F);
-            int lit = countLiterals(F);
-            if (lit < bestLit) { bestLit = lit; bestF = F; }
-            if (F == prev) break;
+        // (a2) Extreme rigid structure: nearly all cubes essential, expand futile
+        if (iter == 0 && removed == 0 &&
+                shrunk >= (int)cover.size() * 99 / 100) {
+            LOG("[%.1fs] extreme rigid structure -- stop (iter=%d, shrunk=%d/%zu)\n",
+                elapsed(), iter, shrunk, cover.size());
+            break;
         }
-    } else {
-        // Large case: single expand pass with 2 trials, then greedy iterations
-        // Try more trials in second pass if time allows
-        const int MAX_ITER = 5;
-        for (int iter = 0; iter < MAX_ITER; ++iter) {
-            long long elapsed = wallMs() - t0;
-            if (elapsed > timeLimitMs) break;
-            numExpandTrials = 2;
-            auto prev = F;
-            reduce(F);
-            expandAll(F);
-            dedup(F);
-            irredundant(F);
-            verifyAndPatch(F);
-            dedup(F);
-            int lit = countLiterals(F);
-            if (lit < bestLit) { bestLit = lit; bestF = F; }
-            if (F == prev) break;
+
+        shuffle(order.begin(), order.end(), rng);
+        // Clamp tmax to last_improve_t + EARLY_STOP_SECS so expand aborts
+        // when it has been stalling, avoiding wasted work on large covers.
+        double expand_tmax = time_limit - 3.0;
+        if (EARLY_STOP_SECS > 0.0)
+            expand_tmax = min(expand_tmax, last_improve_t + EARLY_STOP_SECS);
+        expand_all(order, expand_tmax);
+        dedup(); subsume_pass();
+
+        vector<Cube> cur; cur.reserve(cover.size());
+        for (auto& e:cover) cur.push_back(e.cube);
+        int cur_lits = lit_count(cur);
+        LOG("[%.1fs] iter %d lits=%d best=%d cubes=%zu\n",
+            elapsed(), iter, cur_lits, best_lits, cover.size());
+
+        if (cur_lits < best_lits) {
+            last_improve_t = elapsed();
+            try_save();
+        }
+
+        // (b) No improvement for EARLY_STOP_SECS seconds
+        double stall = elapsed() - last_improve_t;
+        if (EARLY_STOP_SECS > 0.0 && stall > EARLY_STOP_SECS) {
+            LOG("[%.1fs] early stop -- no improvement for %.1fs\n",
+                elapsed(), stall);
+            break;
+        }
+
+        // Restore best every ~5 stall-seconds to escape local optima.
+        if (stall > 0.0 && (int)(stall) % 5 == 0 && (int)(stall) != (int)(stall - 0.1)) {
+            restore_best();
+            LOG("[%.1fs] stall=%.1fs -> restore_best\n", elapsed(), stall);
         }
     }
-
-    dedup(bestF);
-    writeOutput(outFile, bestF);
+    cout << "[" << fixed << setprecision(1) << elapsed() << "s] FINAL "
+         << best.size() << " cubes, " << (best_lits == INT_MAX ? 0 : best_lits) << " lits" << endl;
 }
 
-bool Espresso::hitsOff(const Implicant &imp) const {
-    bool hit = false;
-    forEachCovered(getBase(imp,fullMask), imp.mask, nBit, [&](uint32_t m){ if(offArr[m]) hit=true; });
-    return hit;
+// Entry point
+void Espresso::solve(const char* specFile, const char* outFile) {
+    g_start   = chrono::steady_clock::now();
+    best_lits = INT_MAX;
+    out_file  = outFile;
+    parse(specFile);
+    run(175.0);
+    write_cover(best, outFile);
 }

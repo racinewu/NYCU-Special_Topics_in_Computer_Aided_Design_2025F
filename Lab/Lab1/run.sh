@@ -40,10 +40,11 @@ run_case() {
     if [[ "$MODE" == "valgrind" ]]; then
         valgrind --leak-check=full --show-leak-kinds=all "$TARGET" "$INPUT_FILE" "$OUTPUT_FILE"
     else
-       TIME_OUTPUT=$( { /usr/bin/time -f "Real: %e s, User: %U s, Sys: %S s, CPU%%: %P, MaxMem: %M KB, VolCS: %c" timeout 180s "$TARGET" "$INPUT_FILE" "$OUTPUT_FILE"; } 2>&1 )
+        TIME_FILE=$(mktemp)
+        timeout 180s /usr/bin/time -f "Real: %e s, User: %U s, Sys: %S s, CPU%%: %P, MaxMem: %M KB, VolCS: %c" -o "$TIME_FILE" "$TARGET" "$INPUT_FILE" "$OUTPUT_FILE"
 EXIT_CODE=$?
         if [ $EXIT_CODE -eq 124 ]; then
-            log_fail "Timeout for 10s\n"
+            log_fail "Timeout for 180s\n"
         else
             printf "%s\n" "$TIME_OUTPUT"
         fi

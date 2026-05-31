@@ -1,6 +1,10 @@
 # Compiler settings
 CXX      = g++
-CXXFLAGS = -std=c++17 -O2 -fno-inline-small-functions -Wall -Iinclude -MMD -MP
+CXXFLAGS = -std=c++17 -O2 -Wall -Iinclude -MMD -MP
+
+ifdef VERBOSE
+CXXFLAGS += -DVERBOSE
+endif
 
 # Source and object files
 SRC = $(wildcard src/*.cpp)
@@ -28,6 +32,6 @@ build/%.o: src/%.cpp
 
 # Clean
 clean:
-	rm -rf build bin
+	rm -rf build bin testcase/*.sop
 
 .PHONY: all clean

@@ -63,7 +63,7 @@ struct CoverState {
 
 class Espresso {
 public:
-    void solve(const char* specFile, const char* outFile);
+    void solve(const std::string& inFile, const std::string& outFile);
 
 private:
     int      n_bit    = 0;
@@ -78,8 +78,8 @@ private:
     int best_lits = INT_MAX;
     std::string out_file;
 
-    void parse(const char* specFile);
-    void write_cover(const std::vector<Cube>& cv, const char* path) const;
+    void parse(const std::string& inFile);
+    void write_cover(const std::vector<Cube>& cv, const std::string& path) const;
 
     int  lit_count(const std::vector<Cube>& cv) const;
     void dedup();

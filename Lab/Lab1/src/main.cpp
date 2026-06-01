@@ -9,7 +9,7 @@ int main(int argc, char *argv[])
 {
     if (argc < 3)
     {
-        cerr << "Usage: ./sop <spec_file> <out_sop_file>" << endl;
+        cerr << "Usage: ./sop <input>.txt <output>.sop" << endl;
         return 1;
     }
 
@@ -32,8 +32,8 @@ int main(int argc, char *argv[])
             return 1;
         }
 
-        Espresso solver;
-        solver.solve(argv[1], argv[2]);
+        Espresso optimizer;
+        optimizer.solve(inputFile, outputFile);
 
         return 0;
     }

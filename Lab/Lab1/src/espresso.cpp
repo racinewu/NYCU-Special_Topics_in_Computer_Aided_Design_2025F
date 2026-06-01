@@ -139,11 +139,10 @@ bool CoverState::is_redundant(const Cube& c) const {
 }
 
 // I/O
-// Parse spec file: n_bit, ON minterms, DC minterms.
+// Parse input file: n_bit, ON minterms, DC minterms.
 // Builds safe_hash = ON ∪ DC for the OFF oracle (hits_off).
-void Espresso::parse(const char* specFile) {
-    ifstream fin(specFile);
-    if (!fin) { cerr<<"Cannot open "<<specFile<<"\n"; exit(1); }
+void Espresso::parse(const string& inFile) {
+    ifstream fin(inFile);
     string line;
     getline(fin,line); n_bit = stoi(line);
     full_mask = (n_bit >= 32) ? ~0u : n_bit ? (1u<<n_bit)-1 : 0;
@@ -156,26 +155,30 @@ void Espresso::parse(const char* specFile) {
     safe_hash.reserve(on_set.size() + dc_set.size());
     for (auto& c:on_set) safe_hash.insert(c.on);
     for (auto& c:dc_set) safe_hash.insert(c.on);
-    cout << "[ESPRESSO] n=" << n_bit 
-          << " on=" << on_set.size() 
-          << " dc=" << dc_set.size() 
-          << " safe=" << safe_hash.size() << endl;
+
+    uint32_t total = (n_bit >= 32) ? ~0u : (1u << n_bit);
+    uint32_t off_size = total - (uint32_t)safe_hash.size();
+    cout << "[ESPRESSO] n=" << n_bit
+         << " on=" << on_set.size()
+         << " dc=" << dc_set.size()
+         << " off=" << off_size
+         << " safe=" << safe_hash.size() << endl;
 }
 
 // Write SOP cover: each cube as a string of '0', '1', '-' (MSB first).
-void Espresso::write_cover(const vector<Cube>& cv, const char* path) const {
-    FILE* f = fopen(path,"w"); if (!f) return;
-    if (n_bit==0) { fprintf(f,"\n"); fclose(f); return; }
-    for (auto& c:cv) {
-        for (int b=n_bit-1;b>=0;b--) {
-            uint32_t bit=1u<<b;
-            if      (c.dc&bit) fputc('-',f);
-            else if (c.on&bit) fputc('1',f);
-            else               fputc('0',f);
+void Espresso::write_cover(const vector<Cube>& cv, const string& outFile) const {
+    ofstream fout(outFile);
+    if (!fout) return;
+    if (n_bit == 0) { fout << "\n"; return; }
+    for (auto& c : cv) {
+        for (int b = n_bit-1; b >= 0; b--) {
+            uint32_t bit = 1u << b;
+            if      (c.dc & bit) fout << '-';
+            else if (c.on & bit) fout << '1';
+            else                 fout << '0';
         }
-        fputc('\n',f);
+        fout << '\n';
     }
-    fclose(f);
 }
 
 // Utility
@@ -534,11 +537,11 @@ void Espresso::run(double time_limit) {
 }
 
 // Entry point
-void Espresso::solve(const char* specFile, const char* outFile) {
+void Espresso::solve(const string& inFile, const string& outFile) {
     g_start   = chrono::steady_clock::now();
     best_lits = INT_MAX;
     out_file  = outFile;
-    parse(specFile);
+    parse(inFile);
     run(175.0);
     write_cover(best, outFile);
 }

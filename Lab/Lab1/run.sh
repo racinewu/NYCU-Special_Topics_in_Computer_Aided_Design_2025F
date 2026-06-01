@@ -42,11 +42,12 @@ run_case() {
     else
         TIME_FILE=$(mktemp)
         timeout 180s /usr/bin/time -f "Real: %e s, User: %U s, Sys: %S s, CPU%%: %P, MaxMem: %M KB, VolCS: %c" -o "$TIME_FILE" "$TARGET" "$INPUT_FILE" "$OUTPUT_FILE"
-EXIT_CODE=$?
+        EXIT_CODE=$?
         if [ $EXIT_CODE -eq 124 ]; then
             log_fail "Timeout for 180s\n"
         else
-            printf "%s\n" "$TIME_OUTPUT"
+            printf "\n"
+            cat "$TIME_FILE"
         fi
     fi
     log_info "Finished case: $CASE."

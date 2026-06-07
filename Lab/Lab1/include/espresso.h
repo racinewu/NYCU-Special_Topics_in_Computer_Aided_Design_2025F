@@ -79,7 +79,7 @@ private:
     std::string out_file;
 
     void parse(const std::string& inFile);
-    void write_cover(const std::vector<Cube>& cv, const std::string& path) const;
+    void write_cover(const std::vector<Cube>& cv, const std::string& outFile) const;
 
     int  lit_count(const std::vector<Cube>& cv) const;
     void dedup();

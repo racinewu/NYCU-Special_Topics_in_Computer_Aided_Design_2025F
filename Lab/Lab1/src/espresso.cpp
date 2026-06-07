@@ -217,7 +217,7 @@ void Espresso::try_save() {
     if (lits < best_lits) {
         best_lits = lits; best = cubes;
         LOG("[%.1fs] BEST %zu cubes, %d lits\n", elapsed(), cover.size(), lits);
-        write_cover(cubes, out_file.c_str());
+        write_cover(cubes, out_file);
     }
 }
 

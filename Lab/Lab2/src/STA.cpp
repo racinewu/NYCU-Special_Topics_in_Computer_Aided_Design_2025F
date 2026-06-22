@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cassert>
 #include <algorithm>
+#include <array>
 #include <unordered_set>
 
 using namespace std;
@@ -190,102 +191,46 @@ double STA::Table_Look_Up(Cell* cell, const string& table_name) {
 //   NOR controlling value = HIGH, NAND = LOW, INV is single-input so unused.
 // ==========================================================
 void STA::Set_Cell_Input_Transition_Time(Cell* cell, TimingMode mode) {
-    const string& lib = cell->Lib_Cell_Name;
-    double input_tt = 0.0;
-
     auto arrivalOf = [](const Cell* pre) {
         return pre->Timing.Arrival_Time + pre->Timing.Propagation_Delay + WIRE_DELAY;
     };
+    // Commit the chosen predecessor; a null pre means a PI dominates (arrival = 0).
+    auto apply = [&](Cell* pre, double arrival) {
+        cell->Timing.Prev_Cell             = pre;
+        cell->Timing.Arrival_Time          = pre ? arrival : 0.0;
+        cell->Timing.Input_Transition_Time = pre ? pre->Timing.Output_Transition_Time : 0.0;
+    };
 
-    if (lib.rfind("INV", 0) == 0) {
-        assert(cell->Input_Nets.size() == 1);
-        Net* I = cell->Input_Nets[0];
-        if (I->Type != Net_Type::Input) {
-            Cell* pre = I->Input_Cells.second;
-            assert(pre);
-            input_tt                   = pre->Timing.Output_Transition_Time;
-            cell->Timing.Arrival_Time  = arrivalOf(pre);
-            cell->Timing.Prev_Cell     = pre;
-        }
-    }
-    else if (lib.rfind("NAND", 0) == 0 || lib.rfind("NOR", 0) == 0) {
-        assert(cell->Input_Nets.size() == 2);
-        Net* n0 = cell->Input_Nets[0];
-        Net* n1 = cell->Input_Nets[1];
-
-        bool n0_is_pi = (n0->Type == Net_Type::Input);
-        bool n1_is_pi = (n1->Type == Net_Type::Input);
-
-        if (n0_is_pi && n1_is_pi) {
-            // Both primary inputs: arrival = 0, transition = 0
-        } else if (n0_is_pi || n1_is_pi) {
-            Net*  driven = n0_is_pi ? n1 : n0;
-            Net*  pi_net = n0_is_pi ? n0 : n1;
-            Cell* pre    = driven->Input_Cells.second;
-            assert(pre);
-
-            if (mode == TimingMode::PatternAware &&
-                pi_net->Logic_Value == (int)cell->Controlling_Value) {
-                // PI carries the controlling value; it dominates -> arrival = 0
-                input_tt                  = 0.0;
-                cell->Timing.Arrival_Time = 0.0;
-                cell->Timing.Prev_Cell    = nullptr;
-            } else {
-                input_tt                  = pre->Timing.Output_Transition_Time;
-                cell->Timing.Arrival_Time = arrivalOf(pre);
-                cell->Timing.Prev_Cell    = pre;
-            }
-        } else {
-            Cell* pre0 = n0->Input_Cells.second;
-            Cell* pre1 = n1->Input_Cells.second;
-            assert(pre0 && pre1);
-            double a0 = arrivalOf(pre0), a1 = arrivalOf(pre1);
-
-            if (mode == TimingMode::WorstCase) {
-                // Pick later arrival regardless of logic value
-                if (a0 >= a1) {
-                    input_tt = pre0->Timing.Output_Transition_Time;
-                    cell->Timing.Arrival_Time = a0; cell->Timing.Prev_Cell = pre0;
-                } else {
-                    input_tt = pre1->Timing.Output_Transition_Time;
-                    cell->Timing.Arrival_Time = a1; cell->Timing.Prev_Cell = pre1;
-                }
-            } else {
-                bool cv0 = (n0->Logic_Value == (int)cell->Controlling_Value);
-                bool cv1 = (n1->Logic_Value == (int)cell->Controlling_Value);
-
-                if (cv0 && cv1) {
-                    // Both carry controlling value: pick the one that arrives first
-                    if (a0 <= a1) {
-                        input_tt = pre0->Timing.Output_Transition_Time;
-                        cell->Timing.Arrival_Time = a0; cell->Timing.Prev_Cell = pre0;
-                    } else {
-                        input_tt = pre1->Timing.Output_Transition_Time;
-                        cell->Timing.Arrival_Time = a1; cell->Timing.Prev_Cell = pre1;
-                    }
-                } else if (cv0) {
-                    input_tt = pre0->Timing.Output_Transition_Time;
-                    cell->Timing.Arrival_Time = a0; cell->Timing.Prev_Cell = pre0;
-                } else if (cv1) {
-                    input_tt = pre1->Timing.Output_Transition_Time;
-                    cell->Timing.Arrival_Time = a1; cell->Timing.Prev_Cell = pre1;
-                } else {
-                    // Neither carries controlling value: fall back to latest arrival
-                    if (a0 >= a1) {
-                        input_tt = pre0->Timing.Output_Transition_Time;
-                        cell->Timing.Arrival_Time = a0; cell->Timing.Prev_Cell = pre0;
-                    } else {
-                        input_tt = pre1->Timing.Output_Transition_Time;
-                        cell->Timing.Arrival_Time = a1; cell->Timing.Prev_Cell = pre1;
-                    }
-                }
-            }
-        }
-    } else {
-        cerr << "Unsupported cell type: " << lib << "\n"; abort();
+    // Collect every non-PI input as a candidate driver.
+    struct Drv { Cell* pre; double arr; bool ctrl; };
+    array<Drv, 2> drv;
+    int nd = 0;
+    bool pi_has_ctrl = false;
+    for (Net* n : cell->Input_Nets) {
+        bool ctrl = (n->Logic_Value == (int)cell->Controlling_Value);
+        if (n->Type == Net_Type::Input) { pi_has_ctrl |= ctrl; continue; }
+        Cell* pre = n->Input_Cells.second;
+        assert(pre);
+        drv[nd++] = { pre, arrivalOf(pre), ctrl };
     }
 
-    cell->Timing.Input_Transition_Time = input_tt;
+    if (nd == 0) { apply(nullptr, 0.0); return; } // all inputs are PIs
+
+    if (mode == TimingMode::PatternAware) {
+        // A PI carrying the controlling value alone determines the output.
+        if (pi_has_ctrl) { apply(nullptr, 0.0); return; }
+        // Among drivers carrying the controlling value, take the earliest arrival.
+        const Drv* best = nullptr;
+        for (int i = 0; i < nd; ++i)
+            if (drv[i].ctrl && (!best || drv[i].arr < best->arr)) best = &drv[i];
+        if (best) { apply(best->pre, best->arr); return; }
+    }
+
+    // WorstCase, or PatternAware with no controlling value: take the latest arrival.
+    const Drv* best = &drv[0];
+    for (int i = 1; i < nd; ++i)
+        if (drv[i].arr > best->arr) best = &drv[i];
+    apply(best->pre, best->arr);
 }
 
 // Calculate_Cell_Delay (Step 2)
